@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import datetime
 import os
 
 # ---------------------------------------------------------
@@ -71,6 +72,77 @@ def handle_simulate_pick(temp):
 
 def handle_fast_forward(temp):
     st.session_state.draft_session.simulate_until_user_turn(temperature=temp)
+
+def connect_sleeper_draft():
+    """
+    Links this session to a live Sleeper draft: pulls its team count/rounds
+    so local pick numbering lines up with Sleeper's, and (if a username was
+    given) auto-detects the user's own draft slot.
+    """
+    raw = st.session_state.get("sleeper_draft_input", "")
+    try:
+        draft_id = dp.resolve_sleeper_draft_id(raw)
+        meta = dp.fetch_sleeper_draft(draft_id)
+    except Exception as e:
+        st.session_state.sleeper_connect_error = f"Couldn't connect: {e}"
+        return
+
+    warnings = []
+    st.session_state.sleeper_draft_id = draft_id
+    st.session_state.sleeper_draft_type = meta.get("type", "snake")
+
+    settings = meta.get("settings") or {}
+    if settings.get("teams"):
+        st.session_state.team_count = int(settings["teams"])
+    if settings.get("rounds"):
+        st.session_state.total_rounds = int(settings["rounds"])
+
+    username = st.session_state.get("sleeper_username_input", "").strip()
+    if username:
+        user_id = dp.resolve_sleeper_username(username)
+        slot = (meta.get("draft_order") or {}).get(user_id) if user_id else None
+        if slot:
+            st.session_state.user_pos = int(slot)
+        else:
+            warnings.append(
+                "Couldn't find your draft slot yet (draft order may not be randomized). "
+                "Set 'Your Draft Position' manually below."
+            )
+
+    # A draft session started *before* connecting was built with whatever
+    # team/round settings were on screen at the time - it won't retroactively
+    # pick up Sleeper's real numbers, and a mismatch here would misattribute
+    # every pick's team for the rest of the draft. Flag it instead of
+    # silently wiping an in-progress session the user may not want reset.
+    if st.session_state.get("draft_active"):
+        live = st.session_state.draft_session
+        if live.teams != st.session_state.team_count or live.rounds != st.session_state.total_rounds:
+            warnings.append(
+                f"Your active draft is set up for {live.teams} teams / {live.rounds} rounds, but "
+                f"Sleeper reports {st.session_state.team_count}/{st.session_state.total_rounds}. "
+                "Click **Start / Reset Draft** again before syncing, or picks will be attributed to the wrong team."
+            )
+
+    st.session_state.sleeper_connect_error = " ".join(warnings) if warnings else None
+    st.session_state.draft_mode = "Real Draft"
+
+def disconnect_sleeper_draft():
+    st.session_state.sleeper_draft_id = None
+    st.session_state.sleeper_connect_error = None
+
+def sync_sleeper_picks() -> int:
+    """Pulls the latest picks from the connected Sleeper draft and applies any new ones locally."""
+    draft_id = st.session_state.get("sleeper_draft_id")
+    if not draft_id or not st.session_state.get("draft_active"):
+        return 0
+    picks = dp.fetch_sleeper_draft_picks(draft_id)
+    try:
+        applied = st.session_state.draft_session.sync_from_sleeper_picks(picks)
+    except ValueError as e:
+        st.session_state.sleeper_connect_error = str(e)
+        return 0
+    st.session_state.sleeper_last_sync = datetime.datetime.now().strftime("%H:%M:%S")
+    return len(applied)
 
 
 # ---------------------------------------------------------
@@ -232,6 +304,49 @@ designations are **not** factored in — a player on IR today is projected as he
 """)
 
 
+@st.fragment(run_every="20s")
+def render_sleeper_sync_bar():
+    """
+    Auto-polls the connected Sleeper draft every 20s and applies any new
+    picks - only this fragment reruns on the timer, not the whole page, so
+    it's cheap to leave running. Phone browsers pause background-tab timers
+    once the screen locks or another app takes focus, so the auto-refresh
+    can silently stop there; the manual button (any click inside a fragment
+    reruns just that fragment) is the reliable fallback to catch back up.
+
+    If sync ever breaks (bad network at the venue, Sleeper API hiccup, an
+    out-of-order pick this session can't reconcile), the error and a
+    one-tap way back to fully manual entry live right here in the main body -
+    not just in the sidebar, which is collapsed by default on a phone and
+    easy to miss mid-draft.
+    """
+    applied = sync_sleeper_picks()
+    error = st.session_state.get("sleeper_connect_error")
+
+    c1, c2, c3 = st.columns([3, 1, 1.6])
+    with c1:
+        last = st.session_state.get("sleeper_last_sync")
+        status = f"🔗 Synced to Sleeper draft `{st.session_state.sleeper_draft_id}`"
+        st.caption(status + (f" · last checked {last}" if last else ""))
+    with c2:
+        st.button("🔄 Sync Now", key="manual_sync_btn", width="stretch")
+    with c3:
+        switch_to_manual = st.button("🔓 Switch to Manual", key="manual_fallback_btn", width="stretch")
+
+    if error:
+        st.error(
+            f"⚠️ Sync issue: {error}\n\nSleeper itself is unaffected - keep drafting there. "
+            "Tap **Switch to Manual** to enter picks here yourself instead."
+        )
+
+    if switch_to_manual:
+        disconnect_sleeper_draft()
+        st.rerun()  # escapes the fragment - the whole page needs to reflect manual mode now
+
+    if applied:
+        st.rerun()
+
+
 # ---------------------------------------------------------
 # Sidebar: Configuration & Controls
 # ---------------------------------------------------------
@@ -260,9 +375,32 @@ with st.sidebar:
                 st.error(f"Error refreshing data: {e}")
                 
     st.divider()
+
+    st.header("🔗 Live Sync (Sleeper)")
+    if st.session_state.get("sleeper_draft_id"):
+        st.success(f"Connected: draft `{st.session_state.sleeper_draft_id}`")
+        if st.session_state.get("sleeper_draft_type") not in (None, "snake"):
+            st.warning("⚠️ This isn't a snake draft - pick order/team tracking may not line up.")
+        st.button("Disconnect", on_click=disconnect_sleeper_draft, width="stretch")
+    else:
+        st.text_input(
+            "Sleeper Draft or League URL/ID", key="sleeper_draft_input",
+            placeholder="https://sleeper.com/leagues/.../predraft",
+            help="Either your league link (e.g. the predraft page) or a direct draft link works."
+        )
+        st.text_input(
+            "Your Sleeper Username (optional)", key="sleeper_username_input",
+            help="Auto-detects your draft slot below. Leave blank to set it manually."
+        )
+        st.button("🔗 Connect", on_click=connect_sleeper_draft, width="stretch")
+
+    if st.session_state.get("sleeper_connect_error"):
+        st.error(st.session_state.sleeper_connect_error)
+
+    st.divider()
     st.header("🎮 Draft Mode")
     st.radio("Mode", ["Practice (Mock Draft)", "Real Draft"], key="draft_mode")
-    
+
     st.button("🚀 Start / Reset Draft", on_click=init_draft, type="primary", width="stretch")
 
 
@@ -278,6 +416,7 @@ if not st.session_state.get("draft_active", False):
 draft = st.session_state.draft_session
 engine = st.session_state.valuation_engine
 state = draft.get_current_state()
+synced = bool(st.session_state.get("sleeper_draft_id"))
 
 # Safely extract pick information (protecting against different dictionary keys)
 current_round = state.get('round', 1)
@@ -307,8 +446,13 @@ with col4:
 with col5:
     st.write("Actions")
     c_undo, c_redo = st.columns(2)
-    c_undo.button("↩️ Undo", on_click=handle_undo, width="stretch")
-    c_redo.button("↪️ Redo", on_click=handle_redo, width="stretch")
+    # Disabled while synced: a live pick can't really be "undone" - it's
+    # still on Sleeper's own record, so the next poll would just reapply it.
+    c_undo.button("↩️ Undo", on_click=handle_undo, width="stretch", disabled=synced)
+    c_redo.button("↪️ Redo", on_click=handle_redo, width="stretch", disabled=synced)
+
+if synced:
+    render_sleeper_sync_bar()
 
 st.divider()
 
@@ -371,6 +515,13 @@ if show_summary:
         engine,
         st.session_state.league_settings.roster_slots,
         st.session_state.user_pos
+    )
+
+elif synced:
+    st.subheader("⚡ Action Center")
+    st.info(
+        "🔗 Synced to Sleeper - make picks there. New picks appear here automatically "
+        "within ~20s, or tap **Sync Now** above."
     )
 
 elif state.get("is_user_turn", False) or st.session_state.draft_mode == "Real Draft":
@@ -480,7 +631,8 @@ if not show_summary:
                     key=f"draft_overall_{idx}_{row['player_id']}",
                     on_click=handle_draft_player,
                     args=(row['player_id'],),
-                    width="stretch"
+                    width="stretch",
+                    disabled=synced
                 )
                 st.divider()
     else:
@@ -513,7 +665,8 @@ if not show_summary:
                         key=f"draft_{pos}_{idx}_{row['player_id']}",
                         on_click=handle_draft_player,
                         args=(row['player_id'],),
-                        width="stretch"
+                        width="stretch",
+                        disabled=synced
                     )
             else:
                 st.write(f"No {pos} available.")

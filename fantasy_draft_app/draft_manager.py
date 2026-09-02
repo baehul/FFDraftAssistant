@@ -261,6 +261,66 @@ class DraftSession:
 
         return record
 
+    def _ensure_player_known(self, player_id: str, metadata: Dict, pick_no: int) -> None:
+        """
+        Appends a synthetic row for a player make_pick doesn't know about -
+        e.g. a deep sleeper an opponent drafted on Sleeper that our ADP
+        source never covered (the ADP feed only reaches a few hundred
+        ranked players, not Sleeper's full ~4000-player pool). ADP is
+        anchored to the pick number it was actually taken at, since we have
+        no real ranking for this player; projected_points/bye_week are left
+        unset so valuation falls back to the ADP-curve estimate.
+        """
+        if (self.players_df['player_id'] == player_id).any():
+            return
+        name = f"{metadata.get('first_name', '')} {metadata.get('last_name', '')}".strip() or player_id
+        new_row = {
+            'player_id': player_id,
+            'name': name,
+            'player_name': name,
+            'position': metadata.get('position', 'FA'),
+            'team': metadata.get('team', 'FA'),
+            'adp': float(pick_no),
+        }
+        self.players_df = pd.concat([self.players_df, pd.DataFrame([new_row])], ignore_index=True)
+
+    def sync_from_sleeper_picks(self, sleeper_picks: List[Dict]) -> List[PickRecord]:
+        """
+        Applies any picks from a live Sleeper draft not yet reflected
+        locally. Sleeper's pick_no already matches this session's
+        overall_pick numbering 1:1 (both count from 1 in draft order), and
+        Sleeper's player_id is the same id space this app already uses
+        everywhere (players_df is built from data_pipeline.fetch_sleeper_players),
+        so unlike the ADP/projections pipelines, no name-matching is needed -
+        picks are just applied in order.
+
+        `sleeper_picks` should be sorted by pick_no ascending
+        (fetch_sleeper_draft_picks already returns them that way).
+        Already-applied picks are skipped, so this is safe to call
+        repeatedly with the full picks list on every poll.
+        """
+        applied: List[PickRecord] = []
+        for pick in sleeper_picks:
+            pick_no = pick.get('pick_no')
+            if pick_no is None or pick_no <= len(self.drafted_picks):
+                continue  # already applied
+
+            player_id = pick.get('player_id')
+            if not player_id:
+                break  # not finalized on Sleeper's side yet - stop here, retry next poll
+
+            if pick_no != self.current_pick:
+                raise ValueError(
+                    f"Sleeper sync out of order: expected pick {self.current_pick}, got {pick_no}. "
+                    "The local draft may have diverged (a manual pick or undo?) - reset to resync."
+                )
+
+            player_id = str(player_id)
+            self._ensure_player_known(player_id, pick.get('metadata') or {}, pick_no)
+            applied.append(self.make_pick(player_id))
+
+        return applied
+
     def undo_last_pick(self) -> Optional[PickRecord]:
         """Reverts the last pick made and restores player to the available pool."""
         if not self.drafted_picks:

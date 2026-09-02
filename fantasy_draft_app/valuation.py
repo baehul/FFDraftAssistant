@@ -113,14 +113,26 @@ class ValuationEngine:
         return points
 
     def add_projected_points(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Adds a 'projected_points' season total column if one is not already present."""
-        if df.empty or 'projected_points' in df.columns:
+        """
+        Ensures a 'projected_points' season total column, preferring real
+        per-player projections (data_pipeline's ESPN fetch, joined in as
+        `projected_points` already) and only using the ADP-decay estimate to
+        fill whoever that source didn't cover - unranked rookies, recent
+        signings, deep D/ST-by-committee cases, etc. - so a missing source
+        degrades to the old behavior instead of leaving points blank.
+        """
+        if df.empty:
             return df
 
         df = df.copy()
-        df['projected_points'] = df.apply(
-            lambda r: self._project_baseline_points(r['position'], r['adp']), axis=1
-        )
+        if 'projected_points' not in df.columns:
+            df['projected_points'] = np.nan
+
+        missing = df['projected_points'].isna()
+        if missing.any():
+            df.loc[missing, 'projected_points'] = df.loc[missing].apply(
+                lambda r: self._project_baseline_points(r['position'], r['adp']), axis=1
+            )
         return df
 
     def _calculate_opponent_need_factors(

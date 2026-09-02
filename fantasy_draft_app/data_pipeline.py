@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import logging
 import datetime
+import json
 import re
 import os
 from requests.adapters import HTTPAdapter
@@ -17,9 +18,24 @@ logger = logging.getLogger(__name__)
 
 # Constants
 SLEEPER_API_URL = "https://api.sleeper.app/v1/players/nfl"
+SLEEPER_DRAFT_API_BASE = "https://api.sleeper.app/v1/draft"
+SLEEPER_USER_API_BASE = "https://api.sleeper.app/v1/user"
+SLEEPER_LEAGUE_API_BASE = "https://api.sleeper.app/v1/league"
 FFC_API_BASE = "https://fantasyfootballcalculator.com/api/v1/adp"
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+ESPN_PROJECTIONS_URL = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{year}/segments/0/leaguedefaults/{default_id}"
 VALID_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
+
+# ESPN's per-scoring-format "league defaults" template id - selects which
+# scoring rules the projection endpoint's appliedTotal is computed under.
+# Verified empirically (a high-target WR's projected total moves from ~217
+# to ~277 to ~337 across these three ids, matching the expected standard /
+# half-ppr / full-ppr reception-value spread).
+ESPN_FORMAT_LEAGUE_DEFAULTS = {"standard": 1, "half-ppr": 8, "ppr": 3}
+
+# ESPN's numeric defaultPositionId -> our position strings. Verified against
+# a full player pull: id 16 returns exactly 32 entries (one D/ST per team).
+ESPN_POSITION_MAP = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DEF"}
 
 # ESPN abbreviations that differ from Sleeper's
 ESPN_TEAM_ALIASES = {"WSH": "WAS"}
@@ -121,6 +137,14 @@ def init_db(db_path: str) -> None:
                 bye_week INTEGER
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS projections (
+                player_id TEXT PRIMARY KEY,
+                projected_points REAL,
+                last_updated TIMESTAMP,
+                FOREIGN KEY(player_id) REFERENCES players(player_id)
+            )
+        """)
         conn.commit()
 
 def fetch_sleeper_players() -> list[dict]:
@@ -174,8 +198,113 @@ def fetch_sleeper_players() -> list[dict]:
             "years_exp": int(p_data.get("years_exp") or 0)
         }
         processed_players.append(player)
-        
+
     return processed_players
+
+
+def parse_sleeper_draft_id(raw: str) -> str:
+    """
+    Accepts either a bare draft_id or a full Sleeper URL (e.g.
+    https://sleeper.com/draft/nfl/1234567890123456789) and returns just the
+    numeric id.
+    """
+    raw = (raw or "").strip()
+    match = re.search(r'(\d{10,})', raw)
+    if not match:
+        raise ValueError(f"Couldn't find a draft ID in '{raw}'. Paste the draft URL or just the numeric ID.")
+    return match.group(1)
+
+
+def fetch_sleeper_league_drafts(league_id: str) -> list[dict]:
+    """Returns every draft associated with a Sleeper league_id (normally just the current one)."""
+    session = _get_session()
+    response = session.get(f"{SLEEPER_LEAGUE_API_BASE}/{league_id}/drafts", timeout=15)
+    response.raise_for_status()
+    return response.json() or []
+
+
+def resolve_sleeper_draft_id(raw: str) -> str:
+    """
+    Accepts a draft URL/ID, or a league URL/ID (e.g. the /predraft page,
+    which is what's actually visible before the draft room opens), and
+    returns the real draft_id either way.
+
+    League and draft IDs are both opaque numeric ids from the same id
+    space, indistinguishable by shape alone - so rather than guessing from
+    the URL text, this just tries the id as a draft first (the common case)
+    and falls back to treating it as a league id whose current draft we
+    look up, preferring one that isn't finished yet.
+    """
+    numeric_id = parse_sleeper_draft_id(raw)
+
+    try:
+        return fetch_sleeper_draft(numeric_id)["draft_id"]
+    except (requests.exceptions.HTTPError, ValueError):
+        pass
+
+    drafts = fetch_sleeper_league_drafts(numeric_id)
+    if not drafts:
+        raise ValueError(
+            f"Couldn't find a draft for '{raw}'. If that's a league link, "
+            "that league may not have a draft scheduled yet."
+        )
+    drafts.sort(key=lambda d: d.get("status") == "complete")  # prefer an active/upcoming draft
+    return drafts[0]["draft_id"]
+
+
+def fetch_sleeper_draft(draft_id: str) -> dict:
+    """
+    Fetches a live Sleeper draft's metadata: type (snake/linear/auction),
+    status, settings (teams/rounds), and draft_order (user_id -> slot, once
+    Sleeper has randomized it).
+
+    Unlike the other fetch_* helpers here, this backs a user-initiated
+    "Connect" action rather than a background refresh, so it raises on
+    failure instead of degrading silently - the caller surfaces the error
+    directly instead of the sync quietly never working.
+    """
+    session = _get_session()
+    response = session.get(f"{SLEEPER_DRAFT_API_BASE}/{draft_id}", timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not data:
+        raise ValueError(f"No draft found for ID {draft_id}. Double check the URL/ID.")
+    return data
+
+
+def fetch_sleeper_draft_picks(draft_id: str) -> list[dict]:
+    """
+    Fetches all picks made so far in a live Sleeper draft, sorted by pick_no.
+    This backs repeated polling during the draft, so - unlike
+    fetch_sleeper_draft - it degrades to an empty list on failure rather than
+    raising: a transient network hiccup just means "no new picks found this
+    check" instead of crashing the sync loop.
+    """
+    session = _get_session()
+    try:
+        response = session.get(f"{SLEEPER_DRAFT_API_BASE}/{draft_id}/picks", timeout=15)
+        response.raise_for_status()
+        picks = response.json() or []
+    except Exception as e:
+        logger.error(f"Error fetching Sleeper draft picks: {e}")
+        return []
+    return sorted(picks, key=lambda p: p.get("pick_no", 0))
+
+
+def resolve_sleeper_username(username: str) -> str | None:
+    """Resolves a Sleeper username to its user_id, or None if not found/unreachable."""
+    if not username:
+        return None
+    session = _get_session()
+    try:
+        response = session.get(f"{SLEEPER_USER_API_BASE}/{username}", timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        logger.error(f"Error resolving Sleeper username '{username}': {e}")
+        return None
+    return str(data["user_id"]) if data and data.get("user_id") else None
+
 
 def fetch_adp(format: str = "ppr", teams: int = 12, year: int = None) -> list[dict]:
     if year is None:
@@ -234,12 +363,106 @@ def fetch_bye_weeks(year: int = None) -> dict[str, int]:
     return byes
 
 
+def fetch_espn_projections(format: str = "ppr", year: int = None) -> list[dict]:
+    """
+    Returns [{"name", "position", "projected_points"}, ...] - ESPN's own
+    full-season fantasy point projections (statSourceId=1, a season-total
+    statSplitTypeId=0 record), pulled via the "league defaults" endpoint so
+    no real league/auth is required. The scoring template id is chosen per
+    `format` (see ESPN_FORMAT_LEAGUE_DEFAULTS) so the totals already reflect
+    this league's PPR/half-PPR/standard rules rather than needing to be
+    reconstructed from raw stats afterward.
+
+    Projections are enhancement data over valuation.py's ADP-curve fallback,
+    so - like fetch_bye_weeks - this never raises; a failed fetch just means
+    every player falls back to that estimate.
+    """
+    if year is None:
+        year = datetime.date.today().year
+    default_id = ESPN_FORMAT_LEAGUE_DEFAULTS.get(format, ESPN_FORMAT_LEAGUE_DEFAULTS["ppr"])
+
+    logger.info(f"Fetching {year} ESPN season projections (format: {format})...")
+    url = f"{ESPN_PROJECTIONS_URL.format(year=year, default_id=default_id)}?view=kona_player_info"
+    headers = {
+        "x-fantasy-filter": json.dumps({
+            "players": {
+                "limit": 3000,
+                "sortDraftRanks": {"sortPriority": 1, "sortAsc": True, "value": "PPR"}
+            }
+        }),
+        "Accept": "application/json",
+    }
+    session = _get_session()
+    try:
+        response = session.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        logger.error(f"Error fetching ESPN projections: {e}")
+        return []
+
+    records = []
+    for entry in data.get("players", []):
+        player = entry.get("player", {})
+        position = ESPN_POSITION_MAP.get(player.get("defaultPositionId"))
+        if position is None:
+            continue
+
+        season_stat = next(
+            (s for s in player.get("stats", [])
+             if s.get("statSourceId") == 1 and s.get("statSplitTypeId") == 0
+             and s.get("seasonId") == year),
+            None
+        )
+        if season_stat is None:
+            continue
+
+        records.append({
+            "name": player.get("fullName", ""),
+            "position": position,
+            "projected_points": float(season_stat.get("appliedTotal") or 0.0),
+        })
+
+    return records
+
+
+def _match_sleeper_id(
+    raw_name: str, pos: str,
+    player_lookup: dict, fallback_lookup: dict, team_def_lookup: dict
+) -> str | None:
+    """
+    Resolves an external source's (name, position) to a Sleeper player_id,
+    shared by ADP and projections matching since both face the same D/ST
+    naming quirks and need the same dedicated-then-fallback lookup order.
+    """
+    norm_name = _normalize_name(raw_name)
+    player_id = None
+
+    # 1. Improved DEF Matching using the comprehensive DEF_NAME_MAPPING
+    if pos == "DEF":
+        clean_def_name = re.sub(r'\b(defense|d/st|dst|def)\b', '', norm_name).strip()
+        abbr = DEF_NAME_MAPPING.get(clean_def_name, DEF_NAME_MAPPING.get(norm_name))
+        if abbr:
+            player_id = team_def_lookup.get(abbr.lower())
+
+    # 2. Standard lookups
+    if not player_id:
+        player_id = player_lookup.get((norm_name, pos))
+    if not player_id:
+        player_id = fallback_lookup.get(norm_name)
+
+    if not player_id or str(player_id).strip().lower() in {"", "nan", "none"}:
+        return None
+    return str(player_id).strip()
+
+
 def refresh_database(format: str = "ppr", teams: int = 12) -> dict:
     db_path = _get_db_name(format, teams)
     sleeper_players = fetch_sleeper_players()
     adp_data = fetch_adp(format=format, teams=teams)
-    # Byes are enhancement data - an empty result must not abort the refresh
+    # Byes and projections are enhancement data - an empty result must not abort the refresh
     bye_weeks = fetch_bye_weeks()
+    espn_projections = fetch_espn_projections(format=format)
 
     if not sleeper_players or not adp_data:
         logger.error("Missing critical API data. Aborting refresh to protect database.")
@@ -247,16 +470,16 @@ def refresh_database(format: str = "ppr", teams: int = 12) -> dict:
 
     player_lookup = {}
     fallback_lookup = {}
-    team_def_lookup = {} 
+    team_def_lookup = {}
 
     for p in sleeper_players:
         norm_name = _normalize_name(p["full_name"])
         pos = p["position"]
         pid = str(p["player_id"])
-        
+
         player_lookup[(norm_name, pos)] = pid
         fallback_lookup[norm_name] = pid
-        
+
         if pos == "DEF":
             if p["team"]:
                 team_def_lookup[p["team"].lower()] = pid
@@ -268,35 +491,32 @@ def refresh_database(format: str = "ppr", teams: int = 12) -> dict:
 
     for adp_row in adp_data:
         raw_name = adp_row.get("name", "")
-        norm_name = _normalize_name(raw_name)
         pos = adp_row.get("position", "")
         if pos == "PK": pos = "K"
-            
-        player_id = None
-        
-        # 1. Improved DEF Matching using the comprehensive DEF_NAME_MAPPING
-        if pos == "DEF":
-            clean_def_name = re.sub(r'\b(defense|d/st|dst|def)\b', '', norm_name).strip()
-            abbr = DEF_NAME_MAPPING.get(clean_def_name, DEF_NAME_MAPPING.get(norm_name))
-            if abbr:
-                player_id = team_def_lookup.get(abbr.lower())
-        
-        # 2. Standard lookups
+
+        player_id = _match_sleeper_id(raw_name, pos, player_lookup, fallback_lookup, team_def_lookup)
         if not player_id:
-            player_id = player_lookup.get((norm_name, pos))
-        if not player_id:
-            player_id = fallback_lookup.get(norm_name)
-            
-        if not player_id or str(player_id).strip().lower() in {"", "nan", "none"}:
             continue
 
-        valid_pid = str(player_id).strip()
-        matched_sleeper_ids.add(valid_pid)
+        matched_sleeper_ids.add(player_id)
         adp_insert_records.append((
-            valid_pid, raw_name, format, teams,
+            player_id, raw_name, format, teams,
             float(adp_row.get("adp") or 0.0), float(adp_row.get("stdev") or 0.0),
             int(adp_row.get("high") or 0), int(adp_row.get("low") or 0), now
         ))
+
+    # Projections: keep the first (highest-ranked) match if ESPN ever lists a
+    # player twice, since sortDraftRanks orders the response best-first.
+    projection_insert_records = []
+    matched_projection_ids = set()
+
+    for proj in espn_projections:
+        player_id = _match_sleeper_id(proj["name"], proj["position"], player_lookup, fallback_lookup, team_def_lookup)
+        if not player_id or player_id in matched_projection_ids:
+            continue
+
+        matched_projection_ids.add(player_id)
+        projection_insert_records.append((player_id, proj["projected_points"], now))
 
     # --- NEW: Fallback for unmatched active D/ST and Kickers ---
     for p in sleeper_players:
@@ -328,6 +548,7 @@ def refresh_database(format: str = "ppr", teams: int = 12) -> dict:
         season = datetime.date.today().year
         byes_to_insert = [(team, season, week) for team, week in bye_weeks.items()]
         cursor.executemany("INSERT OR REPLACE INTO team_byes (team, season, bye_week) VALUES (?, ?, ?)", byes_to_insert)
+        cursor.executemany("INSERT OR REPLACE INTO projections (player_id, projected_points, last_updated) VALUES (?, ?, ?)", projection_insert_records)
         conn.commit()
 
     # --- Self-Verification Logging ---
@@ -339,23 +560,31 @@ def refresh_database(format: str = "ppr", teams: int = 12) -> dict:
     logger.info(f"Total D/ST units loaded: {def_count} (Expected >= 30)")
     logger.info(f"Total Kickers loaded: {k_count} (Expected >= 25)")
     logger.info(f"Total bye weeks loaded: {len(bye_weeks)} (Expected 32)")
-    
+    logger.info(f"Total real projections matched: {len(matched_projection_ids)}/{len(espn_projections)} (unmatched players fall back to the ADP-curve estimate)")
+
     if def_count < 30: logger.warning("WARNING: Less than 30 D/ST units were loaded!")
     if k_count < 25: logger.warning("WARNING: Less than 25 Kickers were loaded!")
 
-    return {"db_file": db_path, "players_loaded": len(sleeper_players), "adp_matched": len(matched_sleeper_ids), "adp_total": len(adp_data)}
+    return {
+        "db_file": db_path, "players_loaded": len(sleeper_players),
+        "adp_matched": len(matched_sleeper_ids), "adp_total": len(adp_data),
+        "projections_matched": len(matched_projection_ids), "projections_total": len(espn_projections),
+    }
 
 def get_available_players_df(format: str = "ppr", teams: int = 12) -> pd.DataFrame:
     db_path = _get_db_name(format, teams)
     if not os.path.exists(db_path):
         return pd.DataFrame()
         
-    # Databases built before team_byes existed are still readable: fall back to a
-    # NULL bye_week rather than letting the join fail and blank out the pool.
+    # Databases built before team_byes/projections existed are still readable:
+    # fall back to NULL rather than letting the join fail and blank out the pool.
     try:
         with sqlite3.connect(db_path) as conn:
             has_byes = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='team_byes'"
+            ).fetchone() is not None
+            has_projections = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='projections'"
             ).fetchone() is not None
 
             if has_byes:
@@ -363,12 +592,18 @@ def get_available_players_df(format: str = "ppr", teams: int = 12) -> pd.DataFra
             else:
                 bye_select, bye_join = "NULL as bye_week", ""
 
+            if has_projections:
+                proj_select, proj_join = "pr.projected_points", "LEFT JOIN projections pr ON pr.player_id = p.player_id"
+            else:
+                proj_select, proj_join = "NULL as projected_points", ""
+
             query = f"""
                 SELECT p.player_id, COALESCE(a.full_name, p.full_name) as name, p.position, p.team, p.status,
-                       a.adp, a.high, a.low, a.stdev, a.last_updated, {bye_select}
+                       a.adp, a.high, a.low, a.stdev, a.last_updated, {bye_select}, {proj_select}
                 FROM adp a
                 INNER JOIN players p ON a.player_id = p.player_id
                 {bye_join}
+                {proj_join}
                 ORDER BY a.adp ASC
             """
             df = pd.read_sql_query(query, conn)

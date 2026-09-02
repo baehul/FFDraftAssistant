@@ -1,0 +1,5 @@
+streamlit==1.62.0
+pandas
+numpy
+scipy
+requests

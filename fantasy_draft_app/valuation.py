@@ -40,12 +40,17 @@ class Recommendation:
 
 
 class ValuationEngine:
-    # A gap between consecutive VONA ranks must be at least this many times the
-    # position's typical (median) gap to count as a tier break...
-    TIER_GAP_RATIO_THRESHOLD = 2.5
-    # ...AND at least this fraction of the position's top VONA score, so a
-    # "big" ratio among tiny, noisy values near zero doesn't trigger an alert.
-    TIER_GAP_MIN_FRACTION = 0.15
+    # Two consecutively value-ranked players at a position are considered
+    # separate tiers once their ADPs are at least this many pooled standard
+    # deviations apart - i.e. the market (not just this model) treats them as
+    # drafted in statistically distinct windows. See _find_tier_boundary for
+    # why ADP+stdev replaced a VONA-gap-magnitude heuristic here.
+    TIER_ADP_Z_THRESHOLD = 1.75
+    # Floor/fallback for a player's effective ADP stdev when missing or zero,
+    # matching the fallback _compute_survival_and_baseline uses for the same
+    # purpose (a fixed floor for very early picks, scaling with ADP later).
+    TIER_ADP_STDEV_FLOOR = 1.5
+    TIER_ADP_STDEV_ADP_FRACTION = 0.12
     # Only look for tiers within the top N positive-VONA players per position -
     # tier structure far down the board isn't actionable this pick.
     TIER_MAX_CANDIDATES = 15
@@ -581,7 +586,13 @@ class ValuationEngine:
 
         df['vona_score'] = df.apply(calculate_vona, axis=1).fillna(0.0)
 
-        return df.sort_values('vona_score', ascending=False).reset_index(drop=True)
+        # Ties (most commonly a VONA of 0.0, once a position's baseline
+        # exceeds every remaining player) fall back to ADP ascending, so
+        # equally-valued players still appear in a sensible order instead of
+        # whatever order sort_values' default unstable quicksort leaves them.
+        return df.sort_values(
+            ['vona_score', 'adp'], ascending=[False, True]
+        ).reset_index(drop=True)
 
     def compute_positional_runway(
         self,
@@ -654,25 +665,45 @@ class ValuationEngine:
 
         return pd.DataFrame(rows)
 
-    def _find_tier_boundary(self, vona_sorted: np.ndarray) -> Optional[int]:
+    def _effective_adp_stdev(self, adp: float, stdev: Optional[float]) -> float:
+        """Same fallback _compute_survival_and_baseline uses: trust a real stdev, else scale with ADP."""
+        if stdev is not None and not np.isnan(stdev) and stdev > 0:
+            return float(stdev)
+        return float(max(self.TIER_ADP_STDEV_FLOOR, self.TIER_ADP_STDEV_ADP_FRACTION * adp))
+
+    def _find_tier_boundary(self, pos_df: pd.DataFrame) -> Optional[int]:
         """
-        Given VONA scores sorted descending, returns the 1-indexed size of the
-        top tier - how many players sit before the first significant cliff -
-        or None if values are evenly spread and there's no meaningful break.
+        Given a position's candidates already ranked by descending VONA (best
+        value first), returns the 1-indexed size of the top tier - how many
+        players sit before the market draws a real line - or None if no
+        statistically meaningful break exists among them.
+
+        Tiers are detected from each pair's ADP gap relative to their pooled
+        ADP stdev, not from the magnitude of the VONA gap between them. A
+        VONA-gap threshold has to compare against some "typical" gap for the
+        position - usually the median gap across the whole candidate list -
+        but that list almost always contains more than one real tier
+        boundary, so a later, unrelated break (e.g. a bunched RB3-7 group's
+        own internal jitter) can inflate the median enough to mask an earlier
+        break that's just as real, like a clear RB1/RB2 tier ahead of a
+        tightly-packed group. ADP + stdev sidesteps that: it only asks
+        whether the market itself is drafting these two players in
+        statistically distinct windows, independent of how VONA happens to
+        be distributed elsewhere in the list.
         """
-        if len(vona_sorted) < 2:
+        if len(pos_df) < 2 or pos_df['vona_score'].iloc[0] <= 0:
             return None
 
-        gaps = vona_sorted[:-1] - vona_sorted[1:]
-        median_gap = np.median(gaps)
-        top_value = vona_sorted[0]
-        if top_value <= 0:
-            return None
+        adps = pos_df['adp'].to_numpy()
+        stdevs = pos_df['stdev'].to_numpy() if 'stdev' in pos_df.columns else np.full(len(pos_df), np.nan)
 
-        for i, gap in enumerate(gaps):
-            is_relatively_large = gap >= self.TIER_GAP_RATIO_THRESHOLD * max(median_gap, 1e-6)
-            is_absolutely_significant = gap >= self.TIER_GAP_MIN_FRACTION * top_value
-            if is_relatively_large and is_absolutely_significant:
+        for i in range(len(pos_df) - 1):
+            pooled_sigma = np.sqrt(
+                self._effective_adp_stdev(adps[i], stdevs[i]) ** 2
+                + self._effective_adp_stdev(adps[i + 1], stdevs[i + 1]) ** 2
+            )
+            z = (adps[i + 1] - adps[i]) / pooled_sigma
+            if z >= self.TIER_ADP_Z_THRESHOLD:
                 return i + 1
 
         return None
@@ -717,7 +748,7 @@ class ValuationEngine:
             if len(pos_df) < 2:
                 continue
 
-            tier_size = self._find_tier_boundary(pos_df['vona_score'].to_numpy())
+            tier_size = self._find_tier_boundary(pos_df)
             if tier_size is None:
                 continue
 

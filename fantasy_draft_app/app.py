@@ -410,22 +410,31 @@ if not show_summary:
     st.divider()
     st.subheader("🎯 Recommendation Center")
 
-    # 0. Tier Break Alerts - surface the single most urgent positional cliff,
-    # i.e. where a small group is clearly ahead of the pack right now and
-    # likely to be gone (via opponent picks) before your next turn.
+    # 0. Tier Break Alerts - surface the most urgent positional cliffs, i.e.
+    # where a small group is clearly ahead of the pack right now and likely
+    # to be gone (via opponent picks) before your next turn. Shows up to the
+    # top 2 distinct positions rather than only the single most urgent one -
+    # two tiers can be within a point of each other (e.g. a 2-player RB1
+    # tier vs. a 4-player WR1 tier both breaking before your next pick), and
+    # showing only the top one would arbitrarily hide an equally real cliff.
     tier_alerts = eval_df[eval_df['is_last_in_tier'] & (eval_df['tier_urgency'] > 0)]
     if not tier_alerts.empty:
-        top_alert = tier_alerts.sort_values('tier_urgency', ascending=False).iloc[0]
-        alert_pos = top_alert['position']
-        tier_names = eval_df[
-            (eval_df['position'] == alert_pos) & (eval_df['tier_rank'] > 0)
-        ].sort_values('tier_rank')['name'].tolist()
-
-        st.warning(
-            f"🧨 **{alert_pos} Tier Break:** {', '.join(tier_names)} form the last strong tier - "
-            f"**{top_alert['tier_exhaust_prob'] * 100:.0f}% chance all are gone** by your next pick, "
-            f"costing **~{top_alert['tier_gap_value']:.0f} VONA pts** if you wait."
+        top_alerts = (
+            tier_alerts.sort_values('tier_urgency', ascending=False)
+            .drop_duplicates(subset='position')
+            .head(2)
         )
+        for _, top_alert in top_alerts.iterrows():
+            alert_pos = top_alert['position']
+            tier_names = eval_df[
+                (eval_df['position'] == alert_pos) & (eval_df['tier_rank'] > 0)
+            ].sort_values('tier_rank')['name'].tolist()
+
+            st.warning(
+                f"🧨 **{alert_pos} Tier Break:** {', '.join(tier_names)} form the last strong tier - "
+                f"**{top_alert['tier_exhaust_prob'] * 100:.0f}% chance all are gone** by your next pick, "
+                f"costing **~{top_alert['tier_gap_value']:.0f} VONA pts** if you wait."
+            )
 
     # 1. View Toggle (Sort by VONA vs ADP vs Tier Urgency)
     sort_mode = st.radio(
@@ -434,11 +443,11 @@ if not show_summary:
         horizontal=True, key="rec_sort"
     )
     if sort_mode == "Tier Urgency":
-        sort_cols, sort_ascs = ['tier_urgency', 'vona_score'], [False, False]
+        sort_cols, sort_ascs = ['tier_urgency', 'vona_score', 'adp'], [False, False, True]
     elif sort_mode == "Consensus ADP":
         sort_cols, sort_ascs = ['adp'], [True]
     else:
-        sort_cols, sort_ascs = ['vona_score'], [False]
+        sort_cols, sort_ascs = ['vona_score', 'adp'], [False, True]
     sort_col, sort_asc = sort_cols[0], sort_ascs[0]
 
     # Extract Top 10 Overall
@@ -695,11 +704,11 @@ with tab_pool:
         display_pool = display_pool[display_pool['position'] == filter_pos]
 
     if pool_sort_mode == "Tier Urgency":
-        sort_cols_pool, sort_ascs_pool = ['tier_urgency_pts', 'vona_score'], [False, False]
+        sort_cols_pool, sort_ascs_pool = ['tier_urgency_pts', 'vona_score', 'adp'], [False, False, True]
     elif pool_sort_mode == "Consensus ADP":
         sort_cols_pool, sort_ascs_pool = ['adp'], [True]
     else:
-        sort_cols_pool, sort_ascs_pool = ['vona_score'], [False]
+        sort_cols_pool, sort_ascs_pool = ['vona_score', 'adp'], [False, True]
 
     st.dataframe(
         display_pool.sort_values(by=sort_cols_pool, ascending=sort_ascs_pool).drop(columns=['rank_diff']),

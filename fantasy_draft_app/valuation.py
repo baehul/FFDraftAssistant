@@ -340,15 +340,56 @@ class ValuationEngine:
         return float(np.clip(marginal_fraction, 0.05, 1.15))
 
     def _bye_week_conflicts(self, df: pd.DataFrame, current_roster_df: Optional[pd.DataFrame]) -> pd.Series:
-        """Per-row count of already-rostered players sharing that row's bye week."""
+        """
+        Per-row count of already-rostered players sharing that row's bye week,
+        scoped to who actually matters for that row's slot.
+
+        A candidate that would fill an open starter slot (QB1/TE1, or RB/WR
+        1-3 once the shared FLEX slot is counted in) is checked against the
+        roster's other starters only - a stacked bye among backups doesn't
+        cost a started lineup anything. A candidate that would instead be a
+        backup (QB2+, TE2+, RB4+/WR4+) is checked only against its own
+        position's starter(s) - the only failure mode a backup actually
+        guards against is its starting counterpart being out that week, not
+        an unrelated backup at another position also being on bye.
+        """
         if (
             current_roster_df is None or current_roster_df.empty
             or 'bye_week' not in current_roster_df.columns or 'bye_week' not in df.columns
+            or 'position' not in current_roster_df.columns or 'position' not in df.columns
         ):
             return pd.Series(0, index=df.index)
 
-        roster_bye_counts = current_roster_df['bye_week'].dropna().value_counts()
-        return df['bye_week'].map(roster_bye_counts).fillna(0).astype(int)
+        starters_by_pos: Dict[str, pd.DataFrame] = {}
+        starter_limit_by_pos: Dict[str, int] = {}
+        counts_by_pos: Dict[str, int] = {}
+        for pos in ('QB', 'RB', 'WR', 'TE'):
+            pos_df = current_roster_df[current_roster_df['position'] == pos]
+            starter_limit = self.settings.roster_slots.get(pos, 0)
+            if pos in ('RB', 'WR'):
+                starter_limit += self.settings.roster_slots.get('FLEX', 0)
+            starters_by_pos[pos] = pos_df.iloc[:starter_limit]
+            starter_limit_by_pos[pos] = starter_limit
+            counts_by_pos[pos] = len(pos_df)
+
+        all_starters = pd.concat(starters_by_pos.values()) if starters_by_pos else current_roster_df.iloc[0:0]
+        all_starter_bye_counts = all_starters['bye_week'].dropna().value_counts()
+
+        def _conflicts(row) -> int:
+            position = row['position']
+            bye = row.get('bye_week')
+            if position not in starters_by_pos or pd.isna(bye):
+                return 0
+            if counts_by_pos[position] < starter_limit_by_pos[position]:
+                # This candidate would itself be a starter - compare against
+                # the roster's other starters across all positions.
+                return int(all_starter_bye_counts.get(bye, 0))
+            # This candidate would be a backup - compare only against its
+            # own position's starter(s).
+            own_starter_byes = starters_by_pos[position]['bye_week']
+            return int((own_starter_byes == bye).sum())
+
+        return df.apply(_conflicts, axis=1).astype(int)
 
     def _bye_week_multiplier(self, position: str, conflicts: int) -> float:
         """
